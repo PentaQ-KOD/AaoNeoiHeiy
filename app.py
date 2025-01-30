@@ -7,27 +7,30 @@ from pymongo import MongoClient
 from datetime import datetime
 from dotenv import load_dotenv
 from bson import ObjectId
+# Comment out unused imports
 from sentence_transformers import SentenceTransformer
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-import torch
+# import torch
 import re
 import io
 from pythainlp import word_tokenize
 from pythainlp.util import normalize
-import pdfplumber  # Added for better Thai PDF extraction
+import pdfplumber
 
 # Load environment variables
 load_dotenv()
 
 # Configure Google AI
 genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-model = genai.GenerativeModel('gemini-pro')
-vision_model = genai.GenerativeModel('gemini-pro-vision')
+model = genai.GenerativeModel('gemini-1.5-flash')
+# Remove vision model if not used
+# vision_model = genai.GenerativeModel('gemini-pro-vision')
 
 # Initialize sentence transformer model for embeddings
 # Using multilingual model for better Thai language support
 embedder = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+
 
 # MongoDB setup
 client = MongoClient(os.getenv('MONGODB_URI'))
@@ -54,52 +57,6 @@ if 'initialized' not in st.session_state:
     st.session_state.chunk_size = 512
     st.session_state.chunk_overlap = 50
 
-def normalize_thai_text(text):
-    """Normalize Thai text by cleaning and standardizing characters."""
-    text = normalize(text)
-    text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'[^\u0E00-\u0E7Fa-zA-Z0-9\s.]', '', text)
-    return text.strip()
-
-def chunk_thai_text(text, chunk_size=512, overlap=50):
-    """Chunk Thai text efficiently."""
-    text = normalize_thai_text(text)
-    sentences = text.split('.')
-    
-    chunks = []
-    current_chunk = []
-    current_length = 0
-    
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-        
-        words = word_tokenize(sentence)
-        sentence_length = len(words)
-        
-        if current_length + sentence_length > chunk_size:
-            if current_chunk:
-                chunk_text = ' '.join(current_chunk)
-                chunks.append(chunk_text)
-            
-            if chunks and overlap > 0:
-                last_chunk_words = word_tokenize(chunks[-1])
-                overlap_words = last_chunk_words[-overlap:]
-                current_chunk = overlap_words + words
-            else:
-                current_chunk = words
-                
-            current_length = len(current_chunk)
-        else:
-            current_chunk.extend(words)
-            current_length += sentence_length
-    
-    if current_chunk:
-        chunk_text = ' '.join(current_chunk)
-        chunks.append(chunk_text)
-    
-    return chunks
 
 def clear_pdfs():
     st.session_state.pdf_contents = {}
@@ -131,9 +88,13 @@ def chunk_text(text, chunk_size=512, overlap=50):
 def compute_embeddings(text_chunks, session_id, filename):
     """Compute embeddings for text chunks and store in MongoDB."""
     for i, chunk in enumerate(text_chunks):
+        # Compute embedding
         embedding = embedder.encode(chunk, convert_to_tensor=True)
+        
+        # Convert embedding to list for MongoDB storage
         embedding_list = embedding.cpu().numpy().tolist()
         
+        # Store in MongoDB
         embeddings.insert_one({
             'session_id': ObjectId(session_id),
             'filename': filename,
@@ -142,29 +103,64 @@ def compute_embeddings(text_chunks, session_id, filename):
             'embedding': embedding_list
         })
 
-def retrieve_relevant_chunks(query, top_k=1):
-    """Retrieve the most relevant chunks for the given query."""
-    if not st.session_state.current_session_id:
-        return []
-    
+
+def retrieve_relevant_chunks(query, session_id):
+    """Retrieve relevant chunks using semantic matching"""
     try:
-        query_embedding = embedder.encode(query, convert_to_tensor=True)
-        stored_embeddings = list(embeddings.find({'session_id': ObjectId(st.session_state.current_session_id)}).limit(10))
+        # Generate a search query representation
+        query_response = model.generate_content(
+            f"Please provide a concise summary of this query: {query}",
+            generation_config={
+                'temperature': 0.0,
+                'candidate_count': 1,
+                'max_output_tokens': 1024,
+            }
+        )
+        query_summary = query_response.text
+
+        # Retrieve stored documents
+        stored_docs = list(embeddings.find({'session_id': ObjectId(session_id)}))
         
-        if not stored_embeddings:
+        if not stored_docs:
             return []
-        
-        similarities = []
-        for doc in stored_embeddings:
-            doc_embedding = torch.tensor(doc['embedding'])
-            similarity = cosine_similarity(query_embedding.cpu().numpy().reshape(1, -1), doc_embedding.cpu().numpy().reshape(1, -1))[0][0]
-            similarities.append((similarity, doc['text'], doc['filename']))
-        
-        similarities.sort(reverse=True)
-        return similarities[:top_k]
+
+        # Compare query with stored chunks
+        relevant_chunks = []
+        for doc in stored_docs:
+            try:
+                # Compare summaries
+                comparison_response = model.generate_content(
+                    f"""Compare these two text summaries and rate their similarity from 0 to 1:
+                    Text 1: {query_summary}
+                    Text 2: {doc['embedding']}
+                    Only respond with a number between 0 and 1.""",
+                    generation_config={
+                        'temperature': 0.0,
+                        'candidate_count': 1,
+                    }
+                )
+                
+                try:
+                    similarity = float(comparison_response.text.strip())
+                except:
+                    similarity = 0.0
+                
+                relevant_chunks.append((
+                    similarity,
+                    doc['text'],
+                    doc['filename']
+                ))
+            except Exception as e:
+                continue
+
+        # Sort by similarity and return top chunks
+        relevant_chunks.sort(key=lambda x: x[0], reverse=True)
+        return relevant_chunks[:2]  # Return top 2 most similar chunks
+
     except Exception as e:
-        st.error(f"Retrieval error: {str(e)}")
+        st.error(f"Error retrieving relevant chunks: {str(e)}")
         return []
+
 
 def create_new_session():
     session = {
@@ -255,107 +251,159 @@ def extract_text_from_pdf(file_content):
 
 def get_chat_response(prompt, history, pdf_contents=None):
     try:
-        # Retrieve relevant chunks based on the query
-        relevant_chunks = retrieve_relevant_chunks(prompt)
+        # Check if prompt is empty
+        if not prompt:
+            return "กรุณาส่งคำถาม" if is_thai(prompt) else "Please submit a query"
         
-        # Create a multilingual context
+        # Initialize context and system prompt
+        context = ""
         system_prompt = (
-            "You are a helpful AI assistant capable of understanding and responding in multiple languages "
-            "including Thai and English. Answer based on the provided context if available, "
-            "or use your general knowledge if needed. Keep responses clear and concise. "
-            "Respond in the same language as the user's query."
+            "You are an AI personal assistant with the ability to interact with users naturally and provide helpful," \
+            "context-aware responses. Your task is to assist users by understanding and responding to their questions based on the information available to you." \
+            "You are also capable of reading and processing PDF documents to gather relevant information to provide accurate answers. When a user uploads a PDF file, " \
+            "you will extract the content and use it to inform your responses, ensuring that your answers are accurate and based on the document's information. " \
+            "Your responses should be clear, concise, and user-friendly, reflecting your role as a helpful assistant.\n\n" 
         )
         
-        # Prepare context with length limits and proper encoding
-        context = ""
-        if relevant_chunks:
-            # Take only top 2 most relevant chunks to avoid context length issues
-            for similarity, chunk, filename in relevant_chunks[:2]:
-                # Ensure proper encoding of Thai characters
-                chunk = chunk.encode('utf-8').decode('utf-8')
-                if len(chunk) > 500:  # Limit chunk size
-                    chunk = chunk[:500] + "..."
-                context += f"\nContext from {filename}: {chunk}\n"
+        # If PDF contents exist, use RAG approach
+        if pdf_contents and st.session_state.current_session_id:
+            # Retrieve relevant chunks using embeddings
+            relevant_chunks = retrieve_relevant_chunks(prompt, st.session_state.current_session_id)
+            
+            if relevant_chunks:
+                # Modify system prompt for RAG
+                system_prompt += (
+                    " Base your response primarily on the provided context, "
+                    "while maintaining a natural conversational flow."
+                )
+                
+                # Add context from relevant chunks
+                for similarity, chunk, filename in relevant_chunks[:2]:
+                    chunk = chunk.encode('utf-8').decode('utf-8')
+                    if len(chunk) > 500:
+                        chunk = chunk[:500] + "..."
+                    context += f"\nContext from {filename} (similarity: {similarity:.2f}):\n{chunk}\n"
         
-        # Prepare recent history with proper encoding
+        # Add recent conversation history if available
         recent_history = ""
         if history:
             last_exchange = history[-1]
             user_msg = last_exchange['user'].encode('utf-8').decode('utf-8')
             assistant_msg = last_exchange['assistant'].encode('utf-8').decode('utf-8')
-            recent_history = f"Last exchange:\nUser: {user_msg}\nAssistant: {assistant_msg}\n"
+            recent_history = f"Previous exchange:\nUser: {user_msg}\nAssistant: {assistant_msg}\n"
         
-        # Ensure prompt is properly encoded
+        # Construct the final conversation prompt
         encoded_prompt = prompt.encode('utf-8').decode('utf-8')
+        conversation = f"{system_prompt}\n\n"
         
-        # Combine all parts with controlled length
-        conversation = f"{system_prompt}\n\n{context}\n\n{recent_history}\n\nUser: {encoded_prompt}\nAssistant:"
+        if context:
+            conversation += f"Reference context:\n{context}\n\n"
         
-        # Generate response with more permissive settings
+        if recent_history:
+            conversation += f"{recent_history}\n"
+            
+        conversation += f"User: {encoded_prompt}\nAssistant:"
+        
+        # Generate response using Gemini
         try:
             response = model.generate_content(
                 conversation,
                 generation_config={
-                    'temperature': 0.7,  # More creative responses
-                    'top_p': 0.95,
+                    'temperature': 0.5,
+                    'top_p': 0.9,
                     'top_k': 40,
-                    'max_output_tokens': 1024,  # Longer responses for Thai language
+                    'max_output_tokens': 1024,
                     'candidate_count': 1
                 },
                 safety_settings=[
-                    {
-                        "category": "HARM_CATEGORY_HARASSMENT",
-                        "threshold": "BLOCK_ONLY_HIGH"
-                    },
-                    {
-                        "category": "HARM_CATEGORY_HATE_SPEECH",
-                        "threshold": "BLOCK_ONLY_HIGH"
-                    },
-                    {
-                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                        "threshold": "BLOCK_ONLY_HIGH"
-                    },
-                    {
-                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                        "threshold": "BLOCK_ONLY_HIGH"
-                    }
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_ONLY_HIGH"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"}
                 ]
             )
             
             if hasattr(response, 'text') and response.text:
-                # Ensure the response is properly encoded
-                return response.text.strip().encode('utf-8').decode('utf-8')
+                return response.text.strip()
             else:
                 return "ขออภัย ไม่สามารถสร้างคำตอบได้ กรุณาลองถามใหม่อีกครั้ง" if is_thai(prompt) else \
                        "I apologize, but I couldn't generate a proper response. Please try rephrasing your question."
-                
-        except Exception as e:
-            error_msg = str(e)
-            st.error(f"Response generation error: {error_msg}")
-            
-            # Bilingual error messages
-            if "500" in error_msg:
-                return "ขออภัย คำถามอาจจะซับซ้อนเกินไป กรุณาแบ่งคำถามเป็นส่วนย่อยๆ" if is_thai(prompt) else \
-                       "I apologize, but your question might be too complex. Please try breaking it down into simpler parts."
-            elif "429" in error_msg:
-                return "ขณะนี้มีการร้องขอมากเกินไป กรุณารอสักครู่แล้วลองใหม่" if is_thai(prompt) else \
-                       "I'm receiving too many requests right now. Please wait a moment and try again."
-            elif "safety" in error_msg.lower() or "harm" in error_msg.lower():
-                return "ขออภัย ไม่สามารถตอบคำถามนี้ได้เนื่องจากข้อจำกัดด้านความปลอดภัย กรุณาถามใหม่" if is_thai(prompt) else \
-                       "I apologize, but I cannot generate a response to this query due to content safety restrictions. Please try rephrasing your question."
-            else:
-                return "เกิดข้อผิดพลาด กรุณาลองใหม่หรือเริ่มเซสชันใหม่" if is_thai(prompt) else \
-                       "I encountered an error. Please try rephrasing your question or starting a new session."
-            
+                       
+        except Exception as api_error:
+            st.error(f"Error with Gemini API: {str(api_error)}")
+            return "เกิดข้อผิดพลาดในการติดต่อ API กรุณาลองใหม่" if is_thai(prompt) else \
+                   "An error occurred while contacting the API. Please try again."
+
     except Exception as e:
         st.error(f"Chat processing error: {str(e)}")
         return "เกิดข้อผิดพลาดในการประมวลผลแชท กรุณาลองใหม่" if is_thai(prompt) else \
                "Something went wrong with the chat processing. Please try again."
 
+def normalize_thai_text(text):
+    """Normalize Thai text by cleaning and standardizing characters."""
+    text = normalize(text)
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^\u0E00-\u0E7Fa-zA-Z0-9\s.]', '', text)
+    return text.strip()
+
+# เพิ่มฟังก์ชั่น chunk_thai_text ที่ขาดหายไป
+def chunk_thai_text(text, chunk_size=512, overlap=50):
+    """ปรับปรุงการแบ่งข้อความภาษาไทยเป็นส่วนๆ"""
+    # Normalize text
+    text = normalize_thai_text(text)
+    
+    # Split text into sentences first
+    sentences = text.split('.')
+    
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for sentence in sentences:
+        # Clean the sentence
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+            
+        # Tokenize sentence
+        words = word_tokenize(sentence)
+        sentence_length = len(words)
+        
+        # If adding this sentence exceeds chunk size
+        if current_length + sentence_length > chunk_size:
+            # Save current chunk if it's not empty
+            if current_chunk:
+                chunk_text = ' '.join(current_chunk)
+                chunks.append(chunk_text)
+            
+            # Start new chunk with overlap
+            if chunks and overlap > 0:
+                # Get last few words from previous chunk for overlap
+                last_chunk_words = word_tokenize(chunks[-1])
+                overlap_words = last_chunk_words[-overlap:]
+                current_chunk = overlap_words + words
+            else:
+                current_chunk = words
+                
+            current_length = len(current_chunk)
+        else:
+            current_chunk.extend(words)
+            current_length += sentence_length
+    
+    # Add the last chunk if not empty
+    if current_chunk:
+        chunk_text = ' '.join(current_chunk)
+        chunks.append(chunk_text)
+    
+    return chunks
+
 def is_thai(text):
     """Check if the text contains Thai characters."""
-    thai_chars = set('\u0E00-\u0E7F')
-    return any((char in thai_chars) for char in text)
+    if not text:  # Handle None or empty string
+        return False
+    thai_pattern = re.compile('[\u0E00-\u0E7F]')
+    return bool(thai_pattern.search(text))
+
 
 # Main UI
 st.title("🤖 RAG-Enhanced AI Chat Assistant")
