@@ -2,6 +2,7 @@ import streamlit as st
 import google.generativeai as genai
 import os
 import tempfile
+
 from PyPDF2 import PdfReader
 from pymongo import MongoClient
 from datetime import datetime
@@ -54,8 +55,8 @@ if 'initialized' not in st.session_state:
     st.session_state.chat_history = []
     st.session_state.pdf_contents = {}
     st.session_state.uploaded_files = {}
-    st.session_state.chunk_size = 512
-    st.session_state.chunk_overlap = 50
+    st.session_state.chunk_size = 800
+    st.session_state.chunk_overlap = 80
 
 
 def clear_pdfs():
@@ -113,7 +114,7 @@ def retrieve_relevant_chunks(query, session_id):
             generation_config={
                 'temperature': 0.0,
                 'candidate_count': 1,
-                'max_output_tokens': 1024,
+                'max_output_tokens': 256,
             }
         )
         query_summary = query_response.text
@@ -280,8 +281,8 @@ def get_chat_response(prompt, history, pdf_contents=None):
                 # Add context from relevant chunks
                 for similarity, chunk, filename in relevant_chunks[:2]:
                     chunk = chunk.encode('utf-8').decode('utf-8')
-                    if len(chunk) > 500:
-                        chunk = chunk[:500] + "..."
+                    if len(chunk) > 800:
+                        chunk = chunk[:800] + "..."
                     context += f"\nContext from {filename} (similarity: {similarity:.2f}):\n{chunk}\n"
         
         # Add recent conversation history if available
@@ -347,7 +348,7 @@ def normalize_thai_text(text):
     return text.strip()
 
 # เพิ่มฟังก์ชั่น chunk_thai_text ที่ขาดหายไป
-def chunk_thai_text(text, chunk_size=512, overlap=50):
+def chunk_thai_text(text, chunk_size=800, overlap=80):
     """ปรับปรุงการแบ่งข้อความภาษาไทยเป็นส่วนๆ"""
     # Normalize text
     text = normalize_thai_text(text)
@@ -418,6 +419,7 @@ with st.sidebar:
         # New Session Button
         if st.button("New Chat Session"):
             create_new_session()
+            clear_pdfs()
             st.experimental_rerun()
 
         # PDF Upload
@@ -504,7 +506,7 @@ with st.sidebar:
             "Chunk Size",
             min_value=128,
             max_value=1024,
-            value=512,
+            value=800,
             step=64,
             help="Size of text chunks for processing documents"
         )
@@ -512,7 +514,7 @@ with st.sidebar:
             "Chunk Overlap",
             min_value=0,
             max_value=256,
-            value=50,
+            value=80,
             step=16,
             help="Overlap between consecutive chunks"
         )
