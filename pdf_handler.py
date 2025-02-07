@@ -1,58 +1,34 @@
 import pdfplumber
 from pythainlp.util import normalize
-from pythainlp import word_tokenize
+from pythainlp.tokenize import sent_tokenize, word_tokenize
 import io
 import re
 import streamlit as st
+import fitz  # PyMuPDF
 from PyPDF2 import PdfReader
 
 
 def extract_text_from_pdf(file_content):
     """Extract text from PDF with enhanced Thai language support."""
-    try:
-        pdf_file = io.BytesIO(file_content)
-        text = []
+    pdf_file = io.BytesIO(file_content)
+    doc = fitz.open(stream=pdf_file, filetype="pdf")
 
-        with pdfplumber.open(pdf_file) as pdf:
-            for page in pdf.pages:
-                try:
-                    page_text = page.extract_text()
-                    if page_text:
-                        page_text = normalize_thai_text(page_text)
-                        text.append(page_text)
-                except Exception as e:
-                    st.warning(f"Warning: Could not extract text from a page: {str(e)}")
-                    continue
+    text = []
+    for i, page in enumerate(doc):
+        page_text = page.get_text("text")
+        if page_text:
+            text.append(page_text)
+        else:
+            st.warning(f"⚠️ PyMuPDF อ่านหน้าที่ {i+1} ไม่ได้ (อาจเป็นภาพ)")
 
-        if not text:
-            pdf_file.seek(0)
-            pdf_reader = PdfReader(pdf_file)
-            for page in pdf_reader.pages:
-                try:
-                    page_text = page.extract_text()
-                    if page_text:
-                        page_text = normalize_thai_text(page_text)
-                        text.append(page_text)
-                except Exception as e:
-                    st.warning(
-                        f"Warning: Fallback extraction failed for a page: {str(e)}"
-                    )
-                    continue
-
-        full_text = "\n".join(text)
-        full_text = normalize_thai_text(full_text)
-
-        return full_text if full_text else None
-    except Exception as e:
-        st.error(f"Error processing PDF: {str(e)}")
-        return None
+    return "\n".join(text) if text else None
 
 
 def normalize_thai_text(text):
     """Normalize Thai text by cleaning and standardizing characters."""
     text = normalize(text)
     text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[^\u0E00-\u0E7Fa-zA-Z0-9\s.]", "", text)
+    text = re.sub(r"[^\u0E00-\u0E7Fa-zA-Z0-9\s.,!?()]", "", text)
     return text.strip()
 
 
@@ -63,7 +39,9 @@ def chunk_thai_text(text, chunk_size=800, overlap=80):
     text = normalize_thai_text(text)
 
     # Split text into sentences first
-    sentences = text.split(".")
+    sentences = sent_tokenize(
+        text, engine="whitespace"
+    )  # ใช้ whitespace engine เพื่อรักษาความหมาย
 
     chunks = []
     current_chunk = []
@@ -76,7 +54,7 @@ def chunk_thai_text(text, chunk_size=800, overlap=80):
             continue
 
         # Tokenize sentence
-        words = word_tokenize(sentence)
+        words = word_tokenize(sentence, engine="newmm")
         sentence_length = len(words)
 
         # If adding this sentence exceeds chunk size

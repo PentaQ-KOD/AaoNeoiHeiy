@@ -32,7 +32,7 @@ def compute_embeddings(text_chunks, session_id, filename):
         )
 
 
-def chunk_text(text, chunk_size=512, overlap=50):
+def chunk_text(text, chunk_size=800, overlap=80):
     """Split text into overlapping chunks."""
     chunks = []
     start = 0

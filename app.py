@@ -9,7 +9,7 @@ from db_handler import (
     load_session_messages,
     db_handler,
 )
-from chat_handler import get_chat_response, is_thai, retrieve_relevant_chunks
+from chat_handler import get_chat_response, retrieve_relevant_chunks
 from embeddings_handler import EmbeddingsHandler, chunk_text, compute_embeddings
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -19,9 +19,7 @@ Config.load_env()
 
 
 # Streamlit page config
-st.set_page_config(
-    page_title="AI Chat Assistant with RAG", page_icon="🤖", layout="wide"
-)
+st.set_page_config(page_title="AI Chat Assistant", page_icon="🤖", layout="wide")
 
 # Initialize session states
 # embeddings = get_embeddings_collection()
@@ -57,6 +55,12 @@ with st.sidebar:
             clear_pdfs()
             st.experimental_rerun()
 
+        # ตรวจสอบว่า session_state มี key ที่ใช้เก็บไฟล์หรือไม่
+        if "uploaded_files" not in st.session_state:
+            st.session_state.uploaded_files = {}
+        if "pdf_contents" not in st.session_state:
+            st.session_state.pdf_contents = {}
+
         # PDF Upload
         st.subheader("Upload PDFs")
         uploaded_files = st.file_uploader(
@@ -65,6 +69,21 @@ with st.sidebar:
             accept_multiple_files=True,
             key="pdf_uploader",
         )
+
+        # ตรวจหาไฟล์ที่ถูกลบออก
+        existing_files = set(st.session_state.uploaded_files.keys())
+        current_files = (
+            {file.name for file in uploaded_files} if uploaded_files else set()
+        )
+        deleted_files = existing_files - current_files  # หาชื่อไฟล์ที่ถูกลบไป
+
+        # ลบไฟล์ที่ไม่อยู่ใน uploaded_files แล้ว
+        for deleted_file in deleted_files:
+            del st.session_state.uploaded_files[deleted_file]
+            if deleted_file in st.session_state.pdf_contents:
+                del st.session_state.pdf_contents[deleted_file]
+
+            st.experimental_rerun()  # รีเฟรช UI
 
         if uploaded_files:
             for uploaded_file in uploaded_files:
@@ -107,17 +126,6 @@ with st.sidebar:
                 st.success(
                     f"Successfully processed {len(st.session_state.pdf_contents)} PDF file(s)"
                 )
-
-                # Display uploaded files
-                st.write("Uploaded PDFs:")
-                for filename in st.session_state.pdf_contents.keys():
-                    st.write(f"📄 {filename}")
-
-        # Show clear button only if there are PDFs
-        if st.session_state.pdf_contents:
-            if st.button("Clear All PDFs", key="clear_pdfs"):
-                clear_pdfs()
-                st.experimental_rerun()
 
         # Session selector
         all_sessions = list(db_handler().sessions.find().sort("created_at", -1))
